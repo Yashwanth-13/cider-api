@@ -10,12 +10,12 @@ use reqwest::Client;
 use thiserror::Error;
 use tracing::{debug, instrument, warn};
 
-use crate::types::{
+use crate::{AuthReqErrResponse, AuthReqResponse, AuthRequest, types::{
     AmApiRequest, ApiResponse, AutoplayResponse, IsPlayingResponse, NowPlaying,
     NowPlayingResponse, PlayItemHrefRequest, PlayItemRequest, PlayUrlRequest, QueueItem,
     QueueMoveRequest, QueueRemoveRequest, RatingRequest, RepeatModeResponse, SeekRequest,
     ShuffleModeResponse, VolumeRequest, VolumeResponse,
-};
+}};
 
 /// Default Cider RPC port.
 pub const DEFAULT_PORT: u16 = 10767;
@@ -65,6 +65,72 @@ pub enum CiderError {
     /// Catch-all for unexpected API responses.
     #[error("API error: {0}")]
     Api(String),
+}
+
+/// Errors returned by `/api/v2/auth` endpoint category
+///
+/// # Examples
+///
+/// ```no_run
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// use cider_api::{CiderClient, AuthReqError};
+///
+/// let client = CiderClient::new();
+/// match client.is_active().await {
+///     Ok(()) => println!("Cider is running"),
+///     Err(CiderError::Unauthorized) => println!("Bad API token"),
+///     Err(CiderError::Http(e)) if e.is_connect() => println!("Cider not running"),
+///     Err(e) => println!("Error: {e}"),
+/// }
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Error)]
+pub enum AuthReqError {
+    /// An HTTP-level error from [`reqwest`].
+    #[error("HTTP request failed: {0}")]
+    Http(#[from] reqwest::Error),
+
+    /// Bad body shape, unknown scope or empty scopes array
+    #[error("Bad request. Unknown scope or empty scopes array")]
+    Invalid,
+
+    /// User denied the consent dialog
+    #[error("User denied the API consent dialog")]
+    Denied,
+
+    /// User timeout
+    #[error("User did not respond within 2 minutes")]
+    Timeout,
+
+    /// Another auth dialog is pending
+    #[error("Another auth dialog is pending")]
+    Busy,
+
+    /// Same IP fired another request within 5 secs
+    #[error("Fired another request within 5 seconds")]
+    Cooldown,
+
+    /// Same IP hit 3 denials in 5 min, resulted in 15 min ban
+    #[error("Request denied 3 times in 5 min, resulted in 15 min ban")]
+    Banned,
+
+    /// Dialog returned unexpected shape
+    #[error("Unexpected response shape")]
+    Malformed,
+}
+
+/// Encapsulates all possible Cider Endpoint categories
+#[derive(Debug)]
+pub enum CiderCategory {
+    /// /api/v2/auth
+    Auth,
+
+    /// /api/v2/client
+    Client,
+
+    /// /api/v2/playback
+    Playback
 }
 
 /// Async client for the [Cider](https://cider.sh) music player REST API.
@@ -167,11 +233,60 @@ impl CiderClient {
         self
     }
 
+    /// Generate an API token for authentication. User must approve a consent dialog opened in Cider
+    #[must_use]
+    pub async fn generate_token(mut self, app_name: String, app_image: Option<String>, scopes: Vec<String>) -> Result< AuthReqResponse, AuthReqError> {
+        let mut auth_req = AuthRequest {app_name: app_name, app_image: "".to_string(), scopes: scopes};
+        if let Some(image) = app_image {
+            auth_req.app_image = image;
+        };
+
+        let resp = self
+            .request(reqwest::Method::POST, CiderCategory::Auth, "/request")
+            .json(&auth_req)
+            .send()
+            .await?;
+
+        if resp.status() == 200 {
+            match resp.json::<ApiResponse<AuthReqResponse>>().await {
+                Ok(data) => return Ok(data.data),
+                Err(_) => return Err(AuthReqError::Malformed)
+            }
+        }
+        
+        match resp.status().as_u16() {
+            400 => Err(AuthReqError::Invalid),
+            403 => Err(AuthReqError::Denied),
+            408 => Err(AuthReqError::Timeout),
+            409 => Err(AuthReqError::Busy),
+            429 => {
+                match resp.json::<ApiResponse<AuthReqErrResponse>>().await {
+                    Ok(data) => {
+                        let code = data.data.code;
+                        if code == "AUTH_REQUEST_COOLDOWN" {
+                            return Err(AuthReqError::Cooldown);
+                        } else {
+                            return Err(AuthReqError::Banned);
+                        }
+                    },
+                    _ => Err(AuthReqError::Malformed)
+                }
+            },
+            _ => Err(AuthReqError::Malformed)
+
+        }
+    }
+
     // ── Internal helpers ─────────────────────────────────────────────────
 
-    /// Build a request under `/api/v1/playback`.
-    fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
-        let url = format!("{}/api/v1/playback{}", self.base_url, path);
+    /// Build a request under `CiderCategory`.
+    fn request(&self, method: reqwest::Method, category: CiderCategory, path: &str) -> reqwest::RequestBuilder {
+        let route = match category {
+            CiderCategory::Auth => "auth",
+            CiderCategory::Client => "client",
+            CiderCategory::Playback => "playback"
+        };
+        let url = format!("{}/api/v2/{}{}", self.base_url, route, path);
         let mut req = self.http.request(method, &url);
         if let Some(token) = &self.api_token {
             req = req.header("apptoken", token);
@@ -193,18 +308,17 @@ impl CiderClient {
 
     /// Check that Cider is running and the RPC server is reachable.
     ///
-    /// Sends `GET /active` — Cider responds with `204 No Content` if alive.
+    /// Sends `GET /client/info` — Cider responds with `200 - Ok` if alive.
     ///
     /// # Errors
     ///
-    /// - [`CiderError::Unauthorized`] if the token is wrong.
     /// - [`CiderError::Api`] if the connection is refused or times out.
     #[instrument(skip(self), fields(base_url = %self.base_url))]
     pub async fn is_active(&self) -> Result<(), CiderError> {
         debug!("Checking Cider connection");
 
         let resp = self
-            .request(reqwest::Method::GET, "/active")
+            .request(reqwest::Method::GET, CiderCategory::Client, "/info")
             .send()
             .await
             .map_err(|e| {
@@ -222,7 +336,6 @@ impl CiderClient {
 
         match resp.status().as_u16() {
             200 | 204 => Ok(()),
-            401 | 403 => Err(CiderError::Unauthorized),
             _ => Err(CiderError::Api(format!(
                 "Unexpected response (HTTP {})",
                 resp.status().as_u16()

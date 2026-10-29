@@ -582,6 +582,26 @@ pub struct KeyUrls {
 
 // ─── Endpoint-specific response payloads ─────────────────────────────────────
 
+/// Response Payload for `POST /auth/request`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AuthReqResponse {
+    /// Auth token
+    pub token: String,
+
+    /// Scopes that can be accessed by the auth token
+    pub scopes: Vec<String>
+}
+
+/// Error payload for `POST /auth/request`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AuthReqErrResponse {
+    /// Error code
+    pub code: String,
+
+    /// Error message from the endpoint
+    pub message: String
+}
+
 /// Payload for `GET /is-playing`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct IsPlayingResponse {
@@ -656,6 +676,15 @@ pub struct PlayItemHrefRequest {
 pub struct SeekRequest {
     /// Target position in **seconds**.
     pub position: f64,
+}
+
+/// Request body for `POST /auth/request`.
+#[derive(Debug, Clone, Serialize)]
+pub struct AuthRequest {
+    /// Target position in **seconds**.
+    pub app_name: String,
+    pub app_image: String,
+    pub scopes: Vec<String>
 }
 
 /// Request body for `POST /volume`.
